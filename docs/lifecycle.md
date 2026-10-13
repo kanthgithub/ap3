@@ -141,7 +141,7 @@ For how this maps to compatibility scoring code, see `RemoteAgentDiscoveryServic
 
 * Pull the directive out of `Part.data`.
 * On the **session-opening** envelope, run `validate_directive()`: check signature, expiry, declared participants include itself, supported operation, nonce hasn't been seen before. Pin the signer's pubkey to the session.
-* On **every** subsequent envelope carrying an intent, re-validate: signature against the pinned signer, payload_hash binds the actual payload, and the intent hasn't been replayed.
+* On **every** subsequent envelope, require an intent and re-validate it: signature against the pinned signer, payload_hash binds the actual payload, and the intent hasn't been replayed. An envelope without an intent is refused, and so is the session-opening phase arriving again on an open session.
 * Accept (proceed to Stage 6) or reject (return a `PrivacyProtocolError`).
 
 **Where AP3 fits.** This is the first AP3 round on the wire. Everything before was preparation; everything after is computation.

@@ -110,6 +110,10 @@ class PSIOperation(Operation):
         phase = message.get("phase")
 
         if phase == "init":
+            # `init` opens a session. Accepting it on an open one would replace
+            # the stored commitment with the sender's, resetting the session.
+            if state:
+                raise ProtocolError("PSI receiver: 'init' on an open session", round_num=0)
             commit = _b64d(message["message"])
             if len(commit) != HASH_SIZE:
                 raise ProtocolError("PSI Invalid commitment", round_num=0)

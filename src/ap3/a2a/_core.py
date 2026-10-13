@@ -51,10 +51,15 @@ class _ReceiverSession:
     Stores the initiator's pubkey so that intents on subsequent envelopes
     can be verified to come from the same signer that opened the session —
     a peer cannot mid-session swap in an intent signed by a different key.
+
+    `opening_phase` is the phase that opened the session. It may not arrive
+    again on the same session: re-sending it would reset the operation's
+    state to whatever the sender supplies.
     """
     internal_sid: str
     initiator_pubkey: bytes
     initiator_url: str
+    opening_phase: str
 
 
 class _ProtocolCore:
@@ -285,14 +290,44 @@ class _ProtocolCore:
                 return opened
             result = opened
         else:
-            # Subsequent inbound: each intent-bearing envelope is re-validated
-            # against the cached signer + payload. Envelopes without an intent
-            # are accepted as-is (the operation may emit non-intent-bearing
-            # phases; the framework does not require intent on every round).
-            if envelope.privacy_intent is not None:
-                refusal = self._validate_subsequent_intent(envelope, rx_session)
-                if refusal is not None:
-                    return refusal
+            # Subsequent inbound: every initiator envelope must carry a signed
+            # intent, re-validated against the session's signer and this
+            # envelope's payload. The initiator attaches one to every envelope
+            # it sends, so this refuses nothing legitimate.
+            #
+            # This used to be optional, and an envelope without an intent
+            # skipped validation entirely. Anyone who knew the wire session id
+            # could then drive an open session, including resetting it with
+            # their own opening message and reading the result.
+            #
+            # A refusal here leaves the session in place: an unauthenticated
+            # sender must not be able to end someone else's session either.
+            if envelope.privacy_intent is None:
+                logger.warning("subsequent envelope missing privacy_intent")
+                return self._refuse(
+                    envelope,
+                    PrivacyError(
+                        error_code="MISSING_INTENT",
+                        error_message="every initiator envelope must carry a signed intent",
+                        operation_type=self._operation_type,
+                    ),
+                )
+            refusal = self._validate_subsequent_intent(envelope, rx_session)
+            if refusal is not None:
+                return refusal
+            if envelope.phase == rx_session.opening_phase:
+                logger.warning("opening phase repeated on an open session")
+                return self._refuse(
+                    envelope,
+                    PrivacyError(
+                        error_code="UNEXPECTED_PHASE",
+                        error_message=(
+                            f"phase {envelope.phase!r} opens a session and this "
+                            "session is already open"
+                        ),
+                        operation_type=self._operation_type,
+                    ),
+                )
             try:
                 result = self._operation.process(
                     session_id=rx_session.internal_sid,
@@ -519,6 +554,7 @@ class _ProtocolCore:
                 internal_sid=result["session_id"],
                 initiator_pubkey=peer.public_key,
                 initiator_url=initiator_url,
+                opening_phase=envelope.phase,
             )
         return result
 

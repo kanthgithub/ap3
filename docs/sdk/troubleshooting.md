@@ -247,8 +247,8 @@ logging.basicConfig(level=logging.INFO)
 **Solution:**
 
 ```python
-# Reuse PSIOperation instance across requests — sessions are cleaned up
-# automatically when done=True
+# Reuse PSIOperation instance across requests — a session is removed when it
+# completes (done=True), when a round fails, or when you call abort(session_id)
 psi = PSIOperation()
 # ... use psi for multiple requests ...
 ```

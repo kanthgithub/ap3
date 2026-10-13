@@ -80,6 +80,11 @@ Refer for more details - [Agentic Stack - Stage 1–3](agentic-stack.md#stage-1-
 - Provenance/consent rules on which inputs your dataset is allowed to be used against (this is where regulated industries live).
 - Decide your **security terms** up front: do you require [receiver-signed receipts](directives.md), TEE attestation, ZK proofs, audit logging? — see [Lifecycle](lifecycle.md).
 
+**Workers and session state**
+
+- **Run each receiver as a single worker process.** Sessions, the replay cache and per-session locks live in that process's memory. With more than one worker behind a load balancer, the same signed intent sent to a different worker is accepted again, so **replay protection no longer holds**. A shared state store is planned; until then, scale by running more receivers, each with its own identity, not more workers per receiver.
+- A restart drops open sessions. The initiator gets `SESSION_EXPIRED` and starts a new session.
+
 **Runtime boundary**
 
 - A stable **runtime boundary between LLM reasoning and protocol execution**. AP3 protocol traffic must stay in `Part.data`; never let it land in a prompt. The middleware/executor pattern in the [A2A + AP3 codelab](codelab-a2a-ap3.md) shows the seam.

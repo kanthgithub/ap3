@@ -128,13 +128,20 @@ class Operation(ABC):
             raise KeyError(f"Unknown session: {session_id}")
         ctx = dict(context or {})
         ctx.setdefault("is_first_message", False)
-        result = self.on_process(
-            role=session.role,
-            state=dict(session.state),
-            message=message,
-            config=session.config,
-            context=ctx,
-        )
+        try:
+            result = self.on_process(
+                role=session.role,
+                state=dict(session.state),
+                message=message,
+                config=session.config,
+                context=ctx,
+            )
+        except Exception:
+            # A failed round ends the session. Without this, only a clean
+            # `done` removed it, so every malformed round a peer sent left
+            # its state behind for good.
+            self.abort(session_id)
+            raise
         if result.done:
             self._sessions.pop(session_id, None)
         else:
@@ -144,6 +151,14 @@ class Operation(ABC):
     def has_session(self, session_id: str) -> bool:
         """Return True if a session with this ID is currently active."""
         return session_id in self._sessions
+
+    def abort(self, session_id: str) -> bool:
+        """End a session and discard its state.
+
+        For errors, cancellation and expiry. Returns True if a session was
+        removed, False if there was none.
+        """
+        return self._sessions.pop(session_id, None) is not None
 
     @abstractmethod
     def on_start(

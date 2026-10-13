@@ -1,6 +1,6 @@
 [project]
 name = "ap3"
-version = "1.2.2"
+version = "1.2.3"
 description = "Agent Privacy-Preserving Protocol - AP3"
 readme = "README.md"
 license = { text = "Apache-2.0" }

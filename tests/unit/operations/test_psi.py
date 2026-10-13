@@ -174,6 +174,23 @@ class TestPSIOperationReceiver:
             )
 
     @pytest.mark.unit
+    def test_init_on_open_session_raises(self):
+        """`init` opens a session; on an open one it would replace the commitment."""
+        op = PSIOperation()
+        with pytest.raises(ProtocolError, match="'init' on an open session"):
+            op.on_process(
+                role="receiver",
+                state={
+                    "commit": _b64e(b"0" * HASH_SIZE),
+                    "sid_1": _b64e(b"1" * SESSION_ID_SIZE),
+                    "sanction_hashes": [_b64e(b"h" * 32)],
+                },
+                message={"phase": "init", "message": _b64e(b"2" * HASH_SIZE)},
+                config={"sanction_list": ["x"]},
+                context={},
+            )
+
+    @pytest.mark.unit
     def test_receiver_unknown_phase_raises(self):
         op = PSIOperation()
         with pytest.raises(ProtocolError, match="unexpected phase"):
