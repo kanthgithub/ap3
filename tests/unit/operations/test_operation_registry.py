@@ -124,3 +124,25 @@ class TestOperationSessionLifecycle:
         r1 = op1.start(role="initiator", inputs={"value": 10})
         assert op1.has_session(r1["session_id"]) is True
         assert op2.has_session(r1["session_id"]) is False
+
+    @pytest.mark.unit
+    def test_failed_round_ends_the_session(self):
+        """A round that raises must not leave the session's state behind."""
+        op = ThresholdOp()
+        result = op.start(role="initiator", inputs={"value": 10})
+        sid = result["session_id"]
+
+        # The initiator's process step reads message["approved"]; omit it.
+        with pytest.raises(KeyError):
+            op.process(sid, {"unexpected": True})
+
+        assert op.has_session(sid) is False
+
+    @pytest.mark.unit
+    def test_abort_ends_the_session(self):
+        op = ThresholdOp()
+        sid = op.start(role="initiator", inputs={"value": 10})["session_id"]
+
+        assert op.abort(sid) is True
+        assert op.has_session(sid) is False
+        assert op.abort(sid) is False

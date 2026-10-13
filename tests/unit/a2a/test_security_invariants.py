@@ -334,6 +334,154 @@ async def test_subsequent_intent_signed_by_different_key_is_refused(monkeypatch)
     assert reply.error["error_code"] == "BAD_SIGNATURE"
 
 
+async def _open_genuine_session(
+    agent: PrivacyAgent,
+    *,
+    initiator_priv: bytes,
+    session_id: str,
+    customer: str,
+) -> tuple[PSIOperation, str, str]:
+    """Open a real PSI session with a signed `init` and return the initiator's
+    operation, its internal session id, and the genuine msg1 payload it would
+    send next."""
+    initiator = PSIOperation()
+    start = initiator.start(role="initiator", inputs={"customer_data": customer})
+    init_payload = start["outgoing"]["message"]
+    init_intent = _signed_intent(
+        initiator_priv=initiator_priv, payload=init_payload, session_id=session_id
+    )
+    init_reply = await agent.handle_envelope(
+        _envelope_for(init_intent, payload=init_payload, phase="init")
+    )
+    assert init_reply is not None and init_reply.error is None
+    assert init_reply.phase == "msg0"
+    step = initiator.process(
+        session_id=start["session_id"],
+        message={"phase": init_reply.phase, "message": init_reply.payload},
+    )
+    return initiator, start["session_id"], step["outgoing"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_subsequent_envelope_without_intent_is_refused(monkeypatch):
+    """A continuation envelope with its intent stripped must be refused.
+
+    Previously the receiver validated a continuation only when it carried an
+    intent, so omitting the field skipped every check and the computation ran.
+    The refusal must also leave the session intact: the genuine, signed msg1
+    still completes afterwards.
+    """
+    member = "Jane Smith,S001,456 Elm St"
+    agent, _, _ = _make_receiver(sanction_list=[member])
+    init_priv, init_pub = _make_initiator_keys()
+    _patch_resolve(monkeypatch, agent, _initiator_peer_info(init_pub))
+
+    session_id = "sid-no-intent"
+    initiator, internal_sid, msg1_payload = await _open_genuine_session(
+        agent, initiator_priv=init_priv, session_id=session_id, customer=member
+    )
+
+    unsigned = ProtocolEnvelope(
+        operation=PSIOperation.operation_id,
+        phase="msg1",
+        session_id=session_id,
+        payload=msg1_payload,
+    )
+    reply = await agent.handle_envelope(unsigned)
+    assert reply is not None and reply.error is not None
+    assert reply.error["error_code"] == "MISSING_INTENT"
+
+    signed_intent = _signed_intent(
+        initiator_priv=init_priv, payload=msg1_payload, session_id=session_id
+    )
+    reply = await agent.handle_envelope(
+        _envelope_for(signed_intent, payload=msg1_payload, phase="msg1")
+    )
+    assert reply is not None and reply.error is None
+    assert reply.phase == "msg2"
+    final = initiator.process(
+        session_id=internal_sid, message={"phase": reply.phase, "message": reply.payload}
+    )
+    assert final["result"] == {"is_match": True}
+
+
+@pytest.mark.asyncio
+async def test_unsigned_reinit_cannot_take_over_open_session(monkeypatch):
+    """An outsider who knows only the wire session id must not be able to reset
+    an open session with their own `init` and then query the receiver's list.
+
+    This is the full attack: unsigned re-init, then unsigned msg1 built
+    against the reset session.
+    """
+    member = "Jane Smith,S001,456 Elm St"
+    agent, _, _ = _make_receiver(sanction_list=[member])
+    init_priv, init_pub = _make_initiator_keys()
+    _patch_resolve(monkeypatch, agent, _initiator_peer_info(init_pub))
+
+    session_id = "sid-takeover"
+    await _open_genuine_session(
+        agent, initiator_priv=init_priv, session_id=session_id, customer=member
+    )
+
+    attacker = PSIOperation()
+    start = attacker.start(role="initiator", inputs={"customer_data": member})
+    reinit = ProtocolEnvelope(
+        operation=PSIOperation.operation_id,
+        phase="init",
+        session_id=session_id,
+        payload=start["outgoing"]["message"],
+    )
+    reply = await agent.handle_envelope(reinit)
+    assert reply is not None and reply.error is not None
+    assert reply.error["error_code"] == "MISSING_INTENT"
+
+
+@pytest.mark.asyncio
+async def test_signed_reinit_on_open_session_is_refused(monkeypatch):
+    """Even the session's own signer may not re-send the opening phase."""
+    member = "Jane Smith,S001,456 Elm St"
+    agent, _, _ = _make_receiver(sanction_list=[member])
+    init_priv, init_pub = _make_initiator_keys()
+    _patch_resolve(monkeypatch, agent, _initiator_peer_info(init_pub))
+
+    session_id = "sid-signed-reinit"
+    await _open_genuine_session(
+        agent, initiator_priv=init_priv, session_id=session_id, customer=member
+    )
+
+    fresh = PSIOperation().start(role="initiator", inputs={"customer_data": member})
+    payload = fresh["outgoing"]["message"]
+    intent = _signed_intent(initiator_priv=init_priv, payload=payload, session_id=session_id)
+    reply = await agent.handle_envelope(_envelope_for(intent, payload=payload, phase="init"))
+    assert reply is not None and reply.error is not None
+    assert reply.error["error_code"] == "UNEXPECTED_PHASE"
+
+
+@pytest.mark.asyncio
+async def test_failed_round_clears_both_session_layers(monkeypatch):
+    """A round that fails inside the operation must clear the receiver's
+    session table and the operation's own session state."""
+    member = "Jane Smith,S001,456 Elm St"
+    agent, _, _ = _make_receiver(sanction_list=[member])
+    init_priv, init_pub = _make_initiator_keys()
+    _patch_resolve(monkeypatch, agent, _initiator_peer_info(init_pub))
+
+    session_id = "sid-cleanup"
+    await _open_genuine_session(
+        agent, initiator_priv=init_priv, session_id=session_id, customer=member
+    )
+    internal_sid = agent._core._rx_sessions[session_id].internal_sid
+
+    bad_payload = base64.b64encode(b"too short").decode("utf-8")
+    intent = _signed_intent(initiator_priv=init_priv, payload=bad_payload, session_id=session_id)
+    reply = await agent.handle_envelope(_envelope_for(intent, payload=bad_payload, phase="msg1"))
+    assert reply is not None and reply.error is not None
+    assert reply.error["error_code"] == "OPERATION_ERROR"
+
+    assert session_id not in agent._core._rx_sessions
+    assert not agent._core._operation.has_session(internal_sid)
+
+
 @pytest.mark.asyncio
 async def test_intent_operation_type_mismatch_is_refused(monkeypatch):
     """An intent claiming a different operation_type than the receiver runs

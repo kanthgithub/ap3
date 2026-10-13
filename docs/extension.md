@@ -503,7 +503,8 @@ A receiver that refuses an inbound envelope replies with a `PrivacyError` whose 
 | `error_code` | When it fires | What it means for the initiator |
 |---|---|---|
 | `UNSUPPORTED_WIRE_VERSION` | `envelope.ap3_wire_version` is not in the receiver's `SUPPORTED_WIRE_VERSIONS`. | Upgrade or downgrade to a wire version both peers speak. |
-| `MISSING_INTENT` | First-round envelope arrived without a `privacy_intent`. | Initiator bug — always attach an intent to the session-opening envelope. |
+| `MISSING_INTENT` | An initiator envelope arrived without a `privacy_intent`. Every initiator envelope must carry one, not only the session-opening one. | Initiator bug — attach a fresh signed intent to every envelope. A refusal mid-session leaves the session open, so the correctly signed envelope can still follow. |
+| `UNEXPECTED_PHASE` | The phase that opens a session arrived again on a session that is already open. | A session cannot be restarted in place. Open a new session with a new session ID. |
 | `INVALID_INTENT` | Intent failed pydantic validation, had ≠ 2 participants, or contained an empty URL. | Inspect the intent shape; the receiver also runs a defence-in-depth backstop on `participants` length. |
 | `INVALID_INITIATOR_URL` | `participants[0]` points at a scheme/host the receiver refuses to fetch without authentication (see [Unverified peer URLs (SSRF guard)](security.md#unverified-peer-urls-ssrf-guard)). | Use a routable public URL for the initiator's card. For local dev, flip `allow_private_initiator_urls=True` on the receiver. |
 | `WRONG_RECEIVER` | `participants[1]` does not match this receiver's canonical `self_url`. | Confirm the URL the initiator signed against matches the receiver's advertised card URL (trailing slash, port, scheme — `normalize_url` collapses the common cases). |
