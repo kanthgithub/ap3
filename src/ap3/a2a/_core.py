@@ -25,6 +25,7 @@ from ap3.a2a.client import PeerClient, PeerInfo
 from ap3.a2a._url_safety import UnsafeInitiatorURL, assert_safe_initiator_url
 from ap3.a2a.wire import AP3_WIRE_VERSION, ProtocolEnvelope
 from ap3.core.operation import Operation
+from ap3.services.commitment import CommitmentMetadataSystem
 from ap3.services.compatibility import CommitmentCompatibilityChecker
 from ap3.signing.canonical import canonical_json_bytes
 from ap3.types import (
@@ -120,6 +121,7 @@ class _ProtocolCore:
         peer_url: str,
         inputs: Any,
         expiry_hours: int = DEFAULT_INTENT_EXPIRY_HOURS,
+        refresh_peer: bool = False,
     ) -> PrivacyResultDirective:
         """Full initiator round-trip against one peer.
 
@@ -129,11 +131,27 @@ class _ProtocolCore:
         `on_process` alternates `done=False` with fresh `outgoing` runs
         as many rounds as it needs. Raises PrivacyError on peer refusal,
         missing reply, or the round cap.
+
+        Given the peer card. When a commitment signature does not verify,
+        raise COMMITMENT_SIGNATURE_INVALID and send nothing. The checked
+        commitments are the context passed to operation.start. refresh_peer
+        forces a new card fetch.
         """
-        peer = await self._peer_client.resolve_peer(peer_url)
+        peer = await self._peer_client.resolve_peer(peer_url, force_refresh=refresh_peer)
+        # Changed after signing: stop here, the operation is not started.
+        bad = self._commitment_error(peer)
+        if bad is not None:
+            raise PrivacyProtocolError(bad)
         self._assert_compatible(peer)
 
-        start = self._operation.start(role="initiator", inputs=inputs)
+        start = self._operation.start(
+            role="initiator",
+            inputs=inputs,
+            context={
+                "peer_url": peer_url,
+                "peer_commitments": list(peer.ap3_params.commitments),
+            },
+        )
         internal_sid = start["session_id"]
         outgoing = start.get("outgoing")
         if start.get("done"):
@@ -152,7 +170,28 @@ class _ProtocolCore:
             )
 
         wire_sid = outgoing.get("protocol_session") or internal_sid
+        try:
+            return await self._run_rounds(
+                peer_url=peer_url,
+                internal_sid=internal_sid,
+                wire_sid=wire_sid,
+                outgoing=outgoing,
+                expiry_hours=expiry_hours,
+            )
+        except BaseException:
+            # Includes cancellation from a timeout. A finished session is already gone.
+            self._operation.abort(internal_sid)
+            raise
 
+    async def _run_rounds(
+        self,
+        *,
+        peer_url: str,
+        internal_sid: str,
+        wire_sid: str,
+        outgoing: Any,
+        expiry_hours: int,
+    ) -> PrivacyResultDirective:
         for round_num in range(MAX_ROUNDS):
             # Fresh, payload-bound intent per outbound envelope. Each intent's
             # payload_hash binds *this* envelope's payload, so any mid-session
@@ -395,6 +434,65 @@ class _ProtocolCore:
             error=error.model_dump(mode="json"),
         )
 
+    async def run_intents(
+        self,
+        *,
+        peer_urls: list[str],
+        inputs: Any,
+        expiry_hours: int = DEFAULT_INTENT_EXPIRY_HOURS,
+        refresh_peer: bool = False,
+        timeout_s: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> dict[str, PrivacyResultDirective | BaseException]:
+        """Given one URL per peer. When some peers fail or run past timeout_s. Then every URL still has an entry: its result, or its exception.
+
+        Each call is one two-party intent. A timeout is PEER_TIMEOUT for that URL.
+        timeout_s starts when the session opens, not while it waits for a slot.
+        """
+        if len(set(peer_urls)) != len(peer_urls):
+            raise ValueError("peer_urls has duplicates; results are keyed by URL")
+        if max_concurrency is not None and max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least 1")
+        slots = asyncio.Semaphore(max_concurrency or max(len(peer_urls), 1))
+
+        async def one(url: str) -> PrivacyResultDirective:
+            async with slots:
+                call = self.run_intent(
+                    peer_url=url,
+                    inputs=inputs,
+                    expiry_hours=expiry_hours,
+                    refresh_peer=refresh_peer,
+                )
+                if timeout_s is None:
+                    return await call
+                try:
+                    return await asyncio.wait_for(call, timeout_s)
+                except asyncio.TimeoutError:
+                    raise PrivacyProtocolError(
+                        PrivacyError(
+                            error_code="PEER_TIMEOUT",
+                            error_message=f"no result from {url} within {timeout_s}s",
+                            operation_type=self._operation_type,
+                        )
+                    ) from None
+
+        results = await asyncio.gather(*(one(url) for url in peer_urls), return_exceptions=True)
+        return dict(zip(peer_urls, results))
+
+    def _commitment_error(self, peer: PeerInfo) -> Optional[PrivacyError]:
+        """Given the commitments on a peer card. When one signature fails against peer.public_key. Then COMMITMENT_SIGNATURE_INVALID, else None."""
+        for commitment in peer.ap3_params.commitments:
+            ok = CommitmentMetadataSystem.verify_commitment_signature(
+                commitment, peer.public_key
+            )
+            if not ok:
+                return PrivacyError(
+                    error_code="COMMITMENT_SIGNATURE_INVALID",
+                    error_message="commitment signature is not valid",
+                    operation_type=self._operation_type,
+                )
+        return None
+
     def _assert_compatible(self, peer: PeerInfo) -> None:
         if self._compatibility_scorer is None:
             score, explanation = CommitmentCompatibilityChecker.score_parameter_pair_compatibility(
@@ -518,6 +616,11 @@ class _ProtocolCore:
                         operation_type=self._operation_type,
                     ),
                 )
+
+        # Initiator's card. Same check, and operation.receive is not called.
+        bad = self._commitment_error(peer)
+        if bad is not None:
+            return self._refuse(envelope, bad)
 
         # Shape-level checks + payload binding + replay.
         refusal = self._check_intent_consistency(envelope, intent, peer.public_key)

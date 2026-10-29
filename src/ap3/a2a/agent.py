@@ -114,6 +114,7 @@ class PrivacyAgent(ProtocolHandler):
         self._role = role
         self._host = host
         self._port = port
+        self._private_key = private_key
 
         if isinstance(commitment, list):
             if len(commitment) != 1:
@@ -131,7 +132,7 @@ class PrivacyAgent(ProtocolHandler):
             sig = CommitmentMetadataSystem.sign_commitment(commitment_obj, private_key)
             commitment_obj = commitment_obj.model_copy(update={"signature": sig})
 
-        self._card = build_privacy_agent_card(
+        self._card_spec: dict[str, Any] = dict(
             name=name,
             description=description,
             version="1.0.0",
@@ -143,9 +144,11 @@ class PrivacyAgent(ProtocolHandler):
             skill_tags=skill_tags or ["ap3", operation_type.lower()],
             roles=[role],
             supported_operations=[operation_type],
-            commitments=[commitment_obj],
             public_key=public_key,
             ap3_sdk_version=_AP3_VERSION,
+        )
+        self._card = build_privacy_agent_card(
+            **self._card_spec, commitments=[commitment_obj]
         )
         # Own-side ap3 params, precomputed once for the compat check.
         own_info = extract_peer_info(self._card, agent_url=card_url)
@@ -194,7 +197,7 @@ class PrivacyAgent(ProtocolHandler):
             agent_card=self._card,
         )
         routes: list[Route] = [  # type: ignore[name-defined]
-            *create_agent_card_routes(self._card),
+            *create_agent_card_routes(self._card, card_modifier=self._current_card),
             *create_jsonrpc_routes(request_handler, rpc_url="/"),
         ]
         self._app = Starlette(routes=routes)
@@ -227,17 +230,62 @@ class PrivacyAgent(ProtocolHandler):
 
     # ---- initiator API -----------------------------------------------
 
+    async def _current_card(self, _card):
+        # The route stored the card at startup. Serve the one last published.
+        return self._card
+
+    def update_commitment(self, commitment: CommitmentMetadata) -> None:
+        """Given a commitment with an empty signature. When this runs. Then it is signed and the next card GET returns it.
+
+        A commitment that already has a signature is published as given.
+        """
+        if not commitment.signature:
+            sig = CommitmentMetadataSystem.sign_commitment(commitment, self._private_key)
+            commitment = commitment.model_copy(update={"signature": sig})
+        self._card = build_privacy_agent_card(
+            **self._card_spec, commitments=[commitment]
+        )
+        self._core._own_info = extract_peer_info(
+            self._card, agent_url=self._card_spec["card_url"]
+        )
+
     async def run_intent(
         self,
         *,
         peer_url: str,
         inputs: Any,
         expiry_hours: int = DEFAULT_INTENT_EXPIRY_HOURS,
+        refresh_peer: bool = False,
     ) -> PrivacyResultDirective:
         if self._role != "ap3_initiator":
             raise RuntimeError("run_intent() is only valid for initiators")
         return await self._core.run_intent(
-            peer_url=peer_url, inputs=inputs, expiry_hours=expiry_hours
+            peer_url=peer_url,
+            inputs=inputs,
+            expiry_hours=expiry_hours,
+            refresh_peer=refresh_peer,
+        )
+
+    async def run_intents(
+        self,
+        *,
+        peer_urls: list[str],
+        inputs: Any,
+        expiry_hours: int = DEFAULT_INTENT_EXPIRY_HOURS,
+        refresh_peer: bool = False,
+        timeout_s: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> dict[str, PrivacyResultDirective | BaseException]:
+        """Same contract as _ProtocolCore.run_intents. Initiator only."""
+        if self._role != "ap3_initiator":
+            raise RuntimeError("run_intents() is only valid for initiators")
+        return await self._core.run_intents(
+            peer_urls=peer_urls,
+            inputs=inputs,
+            expiry_hours=expiry_hours,
+            refresh_peer=refresh_peer,
+            timeout_s=timeout_s,
+            max_concurrency=max_concurrency,
         )
 
     # ---- ProtocolHandler impl (inbound) ------------------------------
